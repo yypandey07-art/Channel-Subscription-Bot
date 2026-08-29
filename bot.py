@@ -98,25 +98,65 @@ def get_plans(message):
         ch_id = message.forward_from_chat.id
         ch_name = message.forward_from_chat.title
         msg = bot.send_message(ADMIN_ID, 
-            f"Channel Detected: *{ch_name}*\n\nEnter plans in format (Minutes:Price):\n`Min:Price, Min:Price` \n\n"
-            "Example:\n`1440:99, 43200:199` (1 Day and 30 Days)", parse_mode="Markdown")
+            f"Channel Detected: *{ch_name}*\n\n"
+f"Enter plans in format (Days:Price):\n"
+"Days:Price, Days:Price\n\n"
+"Example:\n15:69, 30:99 (15 Days and 30 Days)"
         bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
     else:
         bot.send_message(ADMIN_ID, "❌ Error: Message was not forwarded. Use /add to try again.")
 
 def finalize_channel(message, ch_id, ch_name):
     try:
-        raw_plans = message.text.split(',')
+        raw_plans = message.text.strip().split(',')
         plans_dict = {}
+
         for p in raw_plans:
-            t, pr = p.strip().split(':')
-            plans_dict[t] = pr
-        
-        channels_col.update_one({"channel_id": ch_id}, {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}}, upsert=True)
+            parts = p.strip().split(':', 1)
+
+            if len(parts) != 2:
+                raise ValueError("Use Days:Price format")
+
+            days = int(parts[0].strip())
+            price = int(parts[1].strip())
+
+            if days <= 0 or price < 0:
+                raise ValueError("Days/Price must be valid numbers")
+
+            # Convert days to minutes
+            minutes = days * 24 * 60
+
+            plans_dict[str(minutes)] = str(price)
+
+        channels_col.update_one(
+            {"channel_id": ch_id},
+            {
+                "$set": {
+                    "name": ch_name,
+                    "plans": plans_dict,
+                    "admin_id": ADMIN_ID
+                }
+            },
+            upsert=True
+        )
+
         bot_username = bot.get_me().username
-        bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
-    except:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ Setup Successful!\n\n"
+            f"Plans: {message.text.strip()}\n\n"
+            f"Invite Link:\n"
+            f"https://t.me/{bot_username}?start={ch_id}"
+        )
+
+    except Exception as e:
+        bot.send_message(
+            ADMIN_ID,
+            "❌ Invalid format.\n\n"
+            "Use: Days:Price, Days:Price\n"
+            "Example: 15:69, 30:99"
+        )
 
 # --- USER: PAYMENT FLOW ---
 
