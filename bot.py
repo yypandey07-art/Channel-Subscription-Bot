@@ -31,6 +31,7 @@ client = MongoClient(MONGO_URI)
 db = client['sub_management']
 channels_col = db['channels']
 users_col = db['users']
+posts_col = db['premium_posts']
 
 # --- ADMIN LOGIC ---
 
@@ -60,7 +61,7 @@ def start_handler(message):
 
     # Admin Panel Greeting
     if user_id == ADMIN_ID:
-        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
+        bot.send_message(message.chat.id, "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels\n/addpost - Create a post with Ads + Premium buttons")
     else:
         bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
 
@@ -199,21 +200,171 @@ def admin_notify(call):
 def approve_now(call):
     _, u_id, ch_id, mins = call.data.split('_')
     u_id, ch_id, mins = int(u_id), int(ch_id), int(mins)
-    
+
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
-        expiry_ts = int(expiry_datetime.timestamp())
 
-        # Link expires when sub ends
-        link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
-        
-        users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
-        
-        bot.send_message(u_id, f"🥳 *Payment Approved!*\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.", parse_mode="Markdown")
-        bot.edit_message_text(f"✅ Approved user {u_id} for {mins} mins.", call.message.chat.id, call.message.message_id)
-        
+        users_col.update_one(
+            {"user_id": u_id},
+            {"$set": {
+                "premium": True,
+                "expiry": expiry_datetime.timestamp()
+            }},
+            upsert=True
+        )
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("👑 Premium Users – Click Here",
+                                        callback_data="premium_menu"))
+
+        bot.send_message(
+            u_id,
+            f"🥳 *Premium Activated!*
+\n"
+            f"Subscription: {mins} Minutes\n"
+            f"Expires: {expiry_datetime.strftime('%d-%m-%Y %I:%M %p')}",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        bot.edit_message_text(
+            f"✅ Approved user {u_id} for {mins} mins.",
+            call.message.chat.id,
+            call.message.message_id
+        )
+
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error: {e}")
+
+
+# --- PREMIUM POST SYSTEM ---
+
+@bot.message_handler(commands=['addpost'], func=lambda m: m.from_user.id == ADMIN_ID)
+def add_post_start(message):
+    msg = bot.send_message(
+        ADMIN_ID,
+        "➕ Send the *Ads/Shortener link* for this post:",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, get_ads_link)
+
+
+def get_ads_link(message):
+    ads_link = (message.text or "").strip()
+    if not ads_link.startswith(("http://", "https://")):
+        bot.send_message(ADMIN_ID, "❌ Please send a valid http/https link.")
+        return
+
+    msg = bot.send_message(
+        ADMIN_ID,
+        "🔐 Now send the *direct Telegram premium content link*.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, save_premium_post, ads_link)
+
+
+def save_premium_post(message, ads_link):
+    premium_link = (message.text or "").strip()
+    if not premium_link.startswith(("http://", "https://")):
+        bot.send_message(ADMIN_ID, "❌ Please send a valid Telegram post/file link.")
+        return
+
+    post = posts_col.insert_one({
+        "ads_link": ads_link,
+        "premium_link": premium_link,
+        "created_at": datetime.now()
+    })
+
+    post_id = str(post.inserted_id)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("🔗 Get Content (Ads)", url=ads_link)
+    )
+    markup.add(
+        InlineKeyboardButton(
+            "👑 Premium Users – Click Here",
+            callback_data=f"premium_{post_id}"
+        )
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        f"✅ Premium post created!\n\n"
+        f"Post ID: `{post_id}`\n\n"
+        "Copy/use the buttons below with your post.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("premium_"))
+def premium_post_click(call):
+    from bson import ObjectId
+
+    try:
+        post_id = call.data.split("_", 1)[1]
+        post = posts_col.find_one({"_id": ObjectId(post_id)})
+
+        if not post:
+            bot.answer_callback_query(call.id, "❌ Post not found.", show_alert=True)
+            return
+
+        user = users_col.find_one({"user_id": call.from_user.id})
+        now = datetime.now().timestamp()
+
+        if not user or not user.get("premium") or user.get("expiry", 0) <= now:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Premium required. Please buy Premium first.",
+                show_alert=True
+            )
+
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium"))
+            bot.send_message(
+                call.message.chat.id,
+                "🔒 This content is for Premium users only.",
+                reply_markup=markup
+            )
+            return
+
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("📥 Open Premium Content", url=post["premium_link"]))
+        bot.send_message(
+            call.message.chat.id,
+            "✅ Premium verified!\n\nYour direct content link:",
+            reply_markup=markup
+        )
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, "❌ Something went wrong.", show_alert=True)
+        bot.send_message(ADMIN_ID, f"❌ Premium post error: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "premium_menu")
+def premium_menu(call):
+    user = users_col.find_one({"user_id": call.from_user.id})
+    if user and user.get("premium") and user.get("expiry", 0) > datetime.now().timestamp():
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            call.message.chat.id,
+            "👑 Premium is active.\n\n"
+            "Open a premium post and tap "
+            "“👑 Premium Users – Click Here”."
+        )
+    else:
+        bot.answer_callback_query(call.id, "Premium expired.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "buy_premium")
+def buy_premium_from_button(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "💎 Please use the subscription link provided by the Admin to buy Premium."
+    )
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
@@ -228,20 +379,25 @@ def manage_ch(call):
 # Automate Kicking
 def kick_expired_users():
     now = datetime.now().timestamp()
-    expired_users = users_col.find({"expiry": {"$lte": now}})
-    bot_username = bot.get_me().username
+    expired_users = users_col.find({
+        "premium": True,
+        "expiry": {"$lte": now}
+    })
 
     for user in expired_users:
         try:
-            bot.ban_chat_member(user['channel_id'], user['user_id'])
-            bot.unban_chat_member(user['channel_id'], user['user_id'])
-            
-            rejoin_url = f"https://t.me/{bot_username}?start={user['channel_id']}"
-            markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🔄 Re-join / Renew", url=rejoin_url))
-            
-            bot.send_message(user['user_id'], "⚠️ Your subscription has expired.\n\nTo join again or renew, please click the button below:", reply_markup=markup)
-            users_col.delete_one({"_id": user['_id']})
-        except: pass
+            users_col.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"premium": False}}
+            )
+            bot.send_message(
+                user["user_id"],
+                "⚠️ Your Premium subscription has expired.\n\n"
+                "Please purchase Premium again to access premium content."
+            )
+        except Exception:
+            pass
+
 
 # --- STARTUP ---
 if __name__ == '__main__':
